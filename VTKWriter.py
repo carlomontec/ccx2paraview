@@ -1,198 +1,169 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# © Ihor Mirzov, UJV Rez, April 2019
-# Inspired by C# converter written by Maciek Hawryłkiewicz in 2015
-
 
 """
+    © Ihor Mirzov, January 2020
+    Distributed under GNU General Public License v3.0
+
+    Inspired by C# converter written by Maciek Hawryłkiewicz in 2015.
+
     About the format read:
     https://vtk.org/wp-content/uploads/2015/04/file-formats.pdf
+
+    Remember that the frd file is node based, so element results are also
+    stored at the nodes after extrapolation from the integration points:
+    http://www.dhondt.de/ccx_2.15.pdf
+
 """
 
 
-class VTKWriter:
+import frd2vtk
+import logging
+import math
 
 
-    # Convert Calculix element type to VTK
-    def convert_elem_type(self, frd_elem_type):
+# Write element connectivity with renumbered nodes
+def write_element_connectivity(renumbered_nodes, e, f):
+    # frd: 20 node brick element
+    if e.type == 4:
+        element_string = '20 '
+        # Last eight nodes have to be repositioned
+        r1 = tuple(range(12)) # 8,9,10,11
+        r2 = tuple(range(12, 16)) # 12,13,14,15
+        r3 = tuple(range(16, 20)) # 16,17,18,19
+        node_num_list = r1 + r3 + r2
+        for i in node_num_list:
+            node = renumbered_nodes[e.nodes[i]] # node after renumbering
+            element_string += '{:d} '.format(node)
+
+    # frd: 15 node penta element
+    elif e.type==5 or e.type==2:
         """
-            Keep in mind that CalculiX expands shell elements
-            In vtk elements nodes are numbered starting from 0, not 1
-
-            For frd see http://www.dhondt.de/cgx_2.15.pdf pages 117-123 (chapter 10)
-            For vtk see https://vtk.org/wp-content/uploads/2015/04/file-formats.pdf pages 9-10
-
-            CalculiX type  1 -  8 node brick element = vtk type 12 - VTK_HEXAHEDRON
-            CalculiX type  2 -  6 node penta element = vtk type 13 - VTK_WEDGE
-            CalculiX type  3 -  4 node   tet element = vtk type 10 - VTK_TETRA
-            CalculiX type  4 - 20 node brick element = vtk type 25 - VTK_QUADRATIC_HEXAHEDRON
-            CalculiX type  5 - 15 node penta element ~ vtk type 13 - VTK_WEDGE
-            CalculiX type  6 - 10 node   tet element = vtk type 24 - VTK_QUADRATIC_TETRA
-            CalculiX type  7 -  3 node shell element = vtk type  5 - VTK_TRIANGLE
-            CalculiX type  8 -  6 node shell element = vtk type 22 - VTK_QUADRATIC_TRIANGLE
-            CalculiX type  9 -  4 node shell element = vtk type  9 - VTK_QUAD
-            CalculiX type 10 -  8 node shell element = vtk type 23 - VTK_QUADRATIC_QUAD
-            CalculiX type 11 -  2 node  beam element = vtk type  3 - VTK_LINE
-            CalculiX type 12 -  3 node  beam element = vtk type 21 - VTK_QUADRATIC_EDGE
+            CalculiX elements type 5 are not supported in VTK and
+            has to be processed as CalculiX type 2 (6 node wedge,
+            VTK type 13). Additional nodes are omitted.
         """
-        # frd_elem_type : vtk_elem_type
-        dic = {
-                 1: 12,
-                 2: 13,
-                 3: 10,
-                 4: 25,
-                 5: 13,
-                 6: 24,
-                 7:  5,
-                 8: 22,
-                 9:  9,
-                10: 23,
-                11:  3,
-                12: 21,
-            }
-        if frd_elem_type in dic:
-            return dic[frd_elem_type]
-        else:
-            return 0
+        element_string = '6 '
+        for i in [0,2,1,3,5,4]: # repositioning nodes
+            node = renumbered_nodes[e.nodes[i]] # node after renumbering
+            element_string += '{:d} '.format(node)
+
+    # All other elements
+    else:
+        n = len(e.nodes)
+        element_string = '{} '.format(n)
+        for i in range(n):
+            node = renumbered_nodes[e.nodes[i]] # node after renumbering
+            element_string += '{:d} '.format(node)
+
+    f.write('\t' + element_string + '\n')
 
 
-    # Renumber and write element nodes
-    def write_element_connectivity(self, renumbered_nodes, e, f):
-        # frd: 20 node brick element
-        if e.type == 4:
-            line = '20 '
-            # Last eight nodes have to be repositioned
-            r1 = tuple(range(12))
-            r2 = tuple(range(12, 16))
-            r3 = tuple(range(16, 20))
-            node_num_list = r1 + r2 + r3
-            for i in node_num_list:
-                node = renumbered_nodes[e.nodes[i]] # node after renumbering
-                line += '{:>8d}'.format(node)
+# Write data
+def write_data(f, b, numnod):
+    f.write('FIELD {} 1\n'.format(b.name))
+    f.write('\t{} {} {} double\n'.format(b.name, len(b.components), numnod))
+    nodes = sorted(b.results.keys())
 
-        # frd: 15 node penta element
-        elif e.type==5 or e.type==2:
-            """ 
-                CalculiX elements type 5 are not supported in VTK and
-                has to be processed as CalculiX type 2 (6 node wedge,
-                VTK type 13). Additional nodes are omitted.
-            """
-            line = '6 '
-            for i in [0,2,1,3,5,4]: # repositioning nodes
-                node = renumbered_nodes[e.nodes[i]] # node after renumbering
-                line += '{:>8d}'.format(node)
+    # Some warnings repeat too much time - mark them
+    emitted_warning_types = {'Inf':0, 'NaN':0}
 
-        # All other elements
-        else:
-            n = len(e.nodes)
-            line = '{0} '.format(n)
-            for i in range(n):
-                node = renumbered_nodes[e.nodes[i]] # node after renumbering
-                line += '{:>8d}'.format(node)
+    for n in range(numnod): # iterate over nodes
+        node = nodes[n]
+        data = b.results[node]
+        f.write('\t')
+        for d in data:
+            # # Filter small values for smooth zero fields
+            # if abs(d) < 1e-9: d = 0
+            if math.isinf(d):
+                d = 0.0
+                emitted_warning_types['Inf'] += 1
+            if math.isnan(d):
+                d = 0.0
+                emitted_warning_types['NaN'] += 1
+            f.write('\t{: .8E}'.format(d))
+        f.write('\n')
 
-        f.write('\t' + line + '\n')
+    for k, v in emitted_warning_types.items():
+        if v > 0:
+            logging.warning('{} {} values are converted to 0.0'.format(v, k))
 
 
-    # Write scalar data
-    def write_scalar_data(self, b, f):
-        f.write('SCALARS {}_{}_{} double\n'.format(b.numstep, b.value, b.name))
-        f.write('LOOKUP_TABLE default\n')
-        for r in b.results:
-            for d in r.data:
-                f.write('\t{:> .8E}\n'.format(d))
+# Main function
+def writeVTK(p, file_name, time): # p is FRDParser object
 
+    with open(file_name, 'w') as f:
+        # Header
+        f.write('# vtk DataFile Version 3.0\n\n')
+        f.write('ASCII\n')
+        f.write('DATASET UNSTRUCTURED_GRID\n\n')
 
-    # Write vector data
-    def write_vector_data(self, b, f):
-        f.write('VECTORS {}_{}_{} double\n'.format(b.numstep, b.value, b.name))
-        for r in b.results:
-            i = 0
-            for d in r.data:
-                i += 1
-                f.write('\t{:> .8E}'.format(d))
-                if i == b.ncomps:
-                    f.write('\n')
-                    i = 0
+        # POINTS section - coordinates of all nodes
+        f.write('POINTS ' + str(p.node_block.numnod) + ' double\n')
+        new_node_number = 0 # node numbers should start from 0
+        renumbered_nodes = {} # old_number : new_number
+        for n in p.node_block.nodes.keys():
 
+            # Write nodes coordinates
+            coordinates = ''.join('\t{: .8E}'.format(coord) \
+                for coord in p.node_block.nodes[n].coords)
+            f.write(coordinates + '\n')
 
-    # Write tensor data
-    def write_tensor_data(self, b, f):
-        f.write('TENSORS {}_{}_{} double\n'.format(b.numstep, b.value, b.name))
-        # for ent in b.entities:
-        #     print(ent.name)
-        for r in b.results:
-            Sxx = r.data[0]; Syy = r.data[1]; Szz = r.data[2]
-            Sxy = r.data[3]; Syz = r.data[4]; Szx = r.data[5]
-            f.write('\t{:> .8E}\t{:> .8E}\t{:> .8E}\n'.format(Sxx, Sxy, 0))
-            f.write('\t{:> .8E}\t{:> .8E}\t{:> .8E}\n'.format(Sxy, Syy, Szx))
-            f.write('\t{:> .8E}\t{:> .8E}\t{:> .8E}\n'.format(  0, Szx, Szz))
-            f.write('\n')
+            # For VTK nodes should go consequently starting from 0
+            renumbered_nodes[n] = new_node_number
+            new_node_number += 1
 
+            if new_node_number == p.node_block.numnod:
+                break
 
-    def __init__(self, p, skip_error_field): # p is FRDParser object
+        f.write('\n')
 
-        # Output file name will be the same as input
-        vtk_filename = p.file_name.replace('.frd', '.vtk')
-        with open(vtk_filename, 'w') as f:
+        # CELLS section - elements connectyvity
+        totn = 0 # total number of nodes
+        for e in p.elem_block.elements:
+            if e.type == 5: totn += 6
+            else: totn += len(e.nodes)
+        f.write('CELLS {} {}\n'.format(p.elem_block.numelem, p.elem_block.numelem + totn)) # number of cells and size of the cell list
+        for e in p.elem_block.elements:
+            write_element_connectivity(renumbered_nodes, e, f)
+        f.write('\n')
 
-            # Header
-            f.write('# vtk DataFile Version 3.0\n')
-            header = p.frd.headers[1].string
-            if header == 'USER': header = ''
-            f.write(header + '\n')
-            f.write('ASCII\n')
-            f.write('DATASET UNSTRUCTURED_GRID\n\n')
+        # CELL TYPES section - write element types:
+        f.write('CELL_TYPES {}\n'.format(p.elem_block.numelem))
+        for e in p.elem_block.elements:
+            vtk_elem_type = frd2vtk.convert_elem_type(e.type)
+            f.write('\t{}\n'.format(vtk_elem_type))
+        f.write('\n')
 
-            # POINTS section - coordinates of all nodes
-            nn = p.frd.node_block.numnod # total number of nodes
-            print('{} nodes total'.format(nn))
-            f.write('POINTS ' + str(nn) + ' double\n')
-            new_node_number = 0; renumbered_nodes = {} # old_number : new_number
-            for n in p.frd.node_block.nodes:
-                # Write nodes coordinates
-                coordinates = ''.join('\t{:> .8E}'.format(coord) for coord in n.pos)
-                f.write(coordinates + '\n')
-
-                # For vtk nodes should be renumbered starting from 0
-                renumbered_nodes[n.number] = new_node_number
-                new_node_number += 1
-            f.write('\n')
-
-            # CELLS section - composition of all elements
-            ne = p.frd.elem_block.numelem # number of elements
-            print('{} cells total'.format(ne))
-            totn = 0 # total number of nodes
-            for e in p.frd.elem_block.elems:
-                if e.type == 5: totn += 6
-                else: totn += len(e.nodes)
-            f.write('CELLS {0} {1}\n'.format(ne, ne + totn)) # number of cells and size of the cell list
-            for e in p.frd.elem_block.elems:
-                self.write_element_connectivity(renumbered_nodes, e, f)
-            f.write('\n')
-
-            # CELL TYPES section - write element types:
-            f.write('CELL_TYPES {0}\n'.format(ne))
-            for e in p.frd.elem_block.elems:
-                vtk_elem_type = self.convert_elem_type(e.type)
-                f.write('\t{0}\n'.format(vtk_elem_type))
-            f.write('\n')
-
-            # POINT DATA - from here start all the results
-            f.write('POINT_DATA {0}\n'.format(nn))
-            for b in p.frd.result_blocks: # iterate over FRDResultBlocks
-                if skip_error_field and 'ERROR' in b.name:
-                    continue
-                print(('Step {}, time {}, {}, {} values'.format(b.numstep, b.value, b.name, b.ncomps)))
-
-                # TODO Some results are in elements, not in nodes!
-                if len(b.results) and len(b.entities):
-                    # Write title
-                    if b.ncomps == 1: # scalar results
-                        self.write_scalar_data(b, f)
-                    elif b.ncomps == 3: # vector results
-                        self.write_vector_data(b, f)
-                    elif b.ncomps == 6:  # tensor results
-                        self.write_tensor_data(b, f)
-                    else:
-                        print('Wrong number of entities')
+        # POINT DATA - from here start all the results
+        f.write('POINT_DATA {}\n'.format(p.node_block.numnod))
+        for b in p.result_blocks: # iterate over NodalResultsBlock
+            if b.value != time: # write results for one time increment only
+                continue
+            if len(b.results) and len(b.components):
+                if b.value < 1:
+                    time_str = 'time {:.2e}, '.format(b.value)
                 else:
-                    print('No data for this step')
+                    time_str = 'time {:.1f}, '.format(b.value)
+                logging.info('Step {}, '.format(b.numstep) +\
+                            time_str +\
+                            '{}, '.format(b.name) +\
+                            '{} components, '.format(len(b.components)) +\
+                            '{} values'.format(len(b.results)))
+                write_data(f, b, p.node_block.numnod)
+            else:
+                logging.warning(b.name, '- no data for this increment')
+
+
+"""
+    TODO learn and use it for future code improvement:
+    https://vtk.org/doc/nightly/html/classvtkUnstructuredGridWriter.html
+    https://vtk.org/doc/nightly/html/c2_vtk_e_5.html#c2_vtk_e_vtkUnstructuredGrid
+    https://vtk.org/gitweb?p=VTK.git;a=blob;f=Examples/DataManipulation/Python/pointToCellData.py
+
+    TODO Use it to write mesh
+    writer = vtk.vtkUnstructuredGridWriter()
+    writer.SetFileName(file_name)
+    writer.SetInputData(unstructured_grid)
+    writer.Write()
+"""
